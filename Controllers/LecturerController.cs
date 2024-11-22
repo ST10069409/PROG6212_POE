@@ -1,5 +1,8 @@
 ﻿using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -9,77 +12,160 @@ namespace PROG6212_Part1.Controllers
 {
     public class LecturerController : Controller
     {
-        // Shared list of claims
-        public static List<Claim> claims = new List<Claim>();
+        private readonly IConfiguration _configuration;
 
-        // Define allowed file types and file size limit (5MB)
-        private static readonly string[] AllowedFileExtensions = { ".pdf", ".docx", ".xlsx" };
-        private const long MaxFileSize = 5 * 1024 * 1024; // 5MB
-
-        // Action to load the Submit and Track Claim page
-        public IActionResult SubmitAndTrackClaim()
+        public LecturerController(IConfiguration configuration)
         {
-            return View(claims); // Pass the claims data to the view
+            _configuration = configuration;
         }
 
-        // POST: Action to handle claim submission with file upload
-        [HttpPost]
-        public IActionResult SubmitClaim(string lecturer, int hoursWorked, decimal hourlyRate, string notes, IFormFile document)
+        public IActionResult SubmitAndTrackClaim()
         {
-            // Validate input fields
+            var claims = GetAllClaimsFromDatabase(); // Fetch claims from database
+            return View(claims);
+        }
+
+        [HttpPost]
+        public IActionResult SubmitClaim(string lecturer, string modulecode, int hoursWorked, decimal hourlyRate, string notes, IFormFile document)
+        {
             if (hoursWorked <= 0 || hourlyRate <= 0 || document == null)
             {
                 ViewBag.ErrorMessage = "Please provide valid data and upload a document.";
-                return View("SubmitAndTrackClaim", claims);
+                return View("SubmitAndTrackClaim", GetAllClaimsFromDatabase());
             }
 
-            // Validate file type and size
+            string[] allowedExtensions = { ".pdf", ".docx", ".xlsx" };
             var fileExtension = Path.GetExtension(document.FileName).ToLower();
-            if (!AllowedFileExtensions.Contains(fileExtension))
+            if (!allowedExtensions.Contains(fileExtension))
             {
                 ViewBag.ErrorMessage = "Invalid file type. Only .pdf, .docx, and .xlsx files are allowed.";
-                return View("SubmitAndTrackClaim", claims);
+                return View("SubmitAndTrackClaim", GetAllClaimsFromDatabase());
             }
-            if (document.Length > MaxFileSize)
+
+            if (document.Length > 5 * 1024 * 1024)
             {
                 ViewBag.ErrorMessage = "File size exceeds 5MB.";
-                return View("SubmitAndTrackClaim", claims);
+                return View("SubmitAndTrackClaim", GetAllClaimsFromDatabase());
             }
 
-            // Generate a new claim ID
-            int newClaimId = claims.Count + 1;
-
-            // Define the storage path 
             string uploadFolder = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot/uploads");
             if (!Directory.Exists(uploadFolder))
             {
                 Directory.CreateDirectory(uploadFolder);
             }
 
-            // Define the file path
-            string uniqueFileName = $"{newClaimId}_{Path.GetFileName(document.FileName)}";
+            int totalAmount = (int)(hoursWorked * hourlyRate);
+            string uniqueFileName = $"{Guid.NewGuid()}_{Path.GetFileName(document.FileName)}";
             string filePath = Path.Combine(uploadFolder, uniqueFileName);
 
-            // Save the file
             using (var fileStream = new FileStream(filePath, FileMode.Create))
             {
                 document.CopyTo(fileStream);
             }
 
-            // Add the claim to the list
-            claims.Add(new Claim
-            {
-                ClaimId = newClaimId,
-                Lecturer = lecturer,
-                HoursWorked = hoursWorked,
-                HourlyRate = hourlyRate,
-                Notes = notes,
-                DocumentPath = $"/uploads/{uniqueFileName}", // Store relative path
-                Status = "Pending"
-            });
+            string connectionString = _configuration.GetConnectionString("DefaultConnection");
 
-            // Redirect to the Submit and Track Claim page
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = @"
+                    INSERT INTO Claims (Lecturer, ModuleCode, HoursWorked, HourlyRate, TotalAmount, Notes, DocumentPath, Status)
+                    VALUES (@Lecturer, @ModuleCode, @HoursWorked, @HourlyRate, @TotalAmount, @Notes, @DocumentPath, 'Pending')";
+
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@Lecturer", lecturer);
+                    cmd.Parameters.AddWithValue("@ModuleCode", modulecode);
+                    cmd.Parameters.AddWithValue("@HoursWorked", hoursWorked);
+                    cmd.Parameters.AddWithValue("@HourlyRate", hourlyRate);
+                    cmd.Parameters.AddWithValue("@TotalAmount", totalAmount);
+                    cmd.Parameters.AddWithValue("@Notes", string.IsNullOrEmpty(notes) ? DBNull.Value : notes);
+                    cmd.Parameters.AddWithValue("@DocumentPath", $"/uploads/{uniqueFileName}");
+
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            TempData["SuccessMessage"] = "Claim submitted successfully.";
             return RedirectToAction("SubmitAndTrackClaim");
+        }
+
+        [HttpPost]
+        public IActionResult AutomateClaimsProcessing()
+        {
+            var claims = GetAllClaimsFromDatabase();
+
+            foreach (var claim in claims)
+            {
+                if (claim.HoursWorked < 5)
+                {
+                    claim.Status = "Rejected";
+                }
+                else
+                {
+                    claim.Status = "Approved";
+                }
+
+                UpdateClaimStatusInDatabase(claim.ClaimId, claim.Status);
+            }
+
+            TempData["SuccessMessage"] = "Claims processed successfully.";
+            return RedirectToAction("SubmitAndTrackClaim");
+        }
+
+        private List<Claim> GetAllClaimsFromDatabase()
+        {
+            var claims = new List<Claim>();
+            string connectionString = _configuration.GetConnectionString("DefaultConnection");
+
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT * FROM Claims";
+
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            claims.Add(new Claim
+                            {
+                                ClaimId = reader.GetInt32(0),
+                                Lecturer = reader.GetString(1),
+                                ModuleCode = reader.GetString(2),
+                                HoursWorked = reader.GetInt32(3),
+                                HourlyRate = (int)reader.GetDecimal(4), // Explicit cast
+                                TotalAmount = (int)reader.GetDecimal(5), // Explicit cast
+                                Notes = reader.IsDBNull(6) ? null : reader.GetString(6),
+                                DocumentPath = reader.IsDBNull(7) ? null : reader.GetString(7),
+                                Status = reader.GetString(8)
+                            });
+                        }
+                    }
+                }
+            }
+
+            return claims;
+        }
+
+        private void UpdateClaimStatusInDatabase(int claimId, string status)
+        {
+            string connectionString = _configuration.GetConnectionString("DefaultConnection");
+
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "UPDATE Claims SET Status = @Status WHERE ClaimId = @ClaimId";
+
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@Status", status);
+                    cmd.Parameters.AddWithValue("@ClaimId", claimId);
+                    cmd.ExecuteNonQuery();
+                }
+            }
         }
     }
 }
+
